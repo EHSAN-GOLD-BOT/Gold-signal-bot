@@ -10,7 +10,7 @@ from flask import Flask
 
 # ================= تنظیمات =================
 # ⚠️ این دو خط رو حتماً با اطلاعات خودت عوض کن ⚠️
-TELEGRAM_TOKEN = "8624639977:AAFe_wnPBkuorYHnzoYB05s8qw7WVAtTSZM"
+TELEGRAM_TOKEN = "9278328589:AAHq-afLrjBWgtS01gK597LeTNiAvV4gXyo"
 TELEGRAM_CHAT_ID = "7290899219"
 SYMBOL = "GC=F"         
 INTERVAL = "15m"        
