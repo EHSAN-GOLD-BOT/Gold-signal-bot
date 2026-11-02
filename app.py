@@ -1,3 +1,4 @@
+
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -9,7 +10,6 @@ from datetime import datetime, time as dtime
 from flask import Flask
 
 # ================= تنظیمات =================
-# ⚠️ این دو خط رو حتماً با اطلاعات خودت عوض کن ⚠️
 TELEGRAM_TOKEN = "9278328589:AAHq-afLrjBWgtS01gK597LeTNiAvV4gXyo"
 TELEGRAM_CHAT_ID = "9242746725"
 SYMBOL = "GC=F"         
@@ -29,7 +29,7 @@ def send_telegram(message):
     try:
         requests.post(url, json=payload)
     except Exception as e:
-        print(f"خطا در تلگرام: {e}")
+        print(f"Error in Telegram: {e}")
 
 def get_data():
     df = yf.download(SYMBOL, period=PERIOD, interval=INTERVAL, progress=False, auto_adjust=True)
@@ -173,10 +173,11 @@ def bot_loop():
                         last_signal = current_sig
             time.sleep(900)
         except Exception as e:
-            print(f"خطا: {e}")
+            print(f"Error: {e}")
             time.sleep(60)
 
 if __name__ == "__main__":
     threading.Thread(target=bot_loop, daemon=True).start()
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
+```
