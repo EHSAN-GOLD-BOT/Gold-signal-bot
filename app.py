@@ -1,4 +1,3 @@
-
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -6,22 +5,20 @@ import requests
 import threading
 import time
 import os
-from datetime import datetime, time as dtime
+from datetime import datetime
 from flask import Flask
 
 # ================= تنظیمات =================
 TELEGRAM_TOKEN = "9278328589:AAHq-afLrjBWgtS01gK597LeTNiAvV4gXyo"
 TELEGRAM_CHAT_ID = "9242746725"
 SYMBOL = "GC=F"         
-INTERVAL = "15m"        
-PERIOD = "5d"           
 # ==========================================
 
 app = Flask(__name__)
 
 @app.route('/')
 def health_check():
-    return "SMC Bot is running 24/7!", 200
+    return "SMC Gold Bot is running 24/7!", 200
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -32,152 +29,137 @@ def send_telegram(message):
         print(f"Error in Telegram: {e}")
 
 def get_data():
-    df = yf.download(SYMBOL, period=PERIOD, interval=INTERVAL, progress=False, auto_adjust=True)
+    # گرفتن دیتای 5 دقیقه‌ای برای 2 روز اخیر (برای سرعت بالا)
+    df = yf.download(SYMBOL, period="2d", interval="5m", progress=False, auto_adjust=True)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
-    return df.dropna()
+    df = df.dropna()
+    df.index = pd.to_datetime(df.index)
+    if df.index.tz is None:
+        df.index = df.index.tz_localize('UTC')
+    else:
+        df.index = df.index.tz_convert('UTC')
+    return df
 
-# ================= توابع تحلیل ۸ گانه =================
+def resample_data(data, timeframe):
+    return data.resample(timeframe, label="right", closed="right").agg({
+        "Open": "first", "High": "max", "Low": "min", "Close": "last"
+    }).dropna()
 
-def find_pivots(df, window=3):
-    highs, lows = [], []
-    for i in range(window, len(df)-window):
-        if float(df['High'].iloc[i]) == float(df['High'].iloc[i-window:i+window+1].max()):
-            highs.append((i, float(df['High'].iloc[i])))
-        if float(df['Low'].iloc[i]) == float(df['Low'].iloc[i-window:i+window+1].min()):
-            lows.append((i, float(df['Low'].iloc[i])))
-    return highs, lows
+def add_indicators(data):
+    data = data.copy()
+    data["EMA50"] = data["Close"].ewm(span=50, adjust=False).mean()
+    data["EMA200"] = data["Close"].ewm(span=200, adjust=False).mean()
+    delta = data["Close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    rs = gain.ewm(alpha=1/14, adjust=False).mean() / loss.ewm(alpha=1/14, adjust=False).mean().replace(0, np.nan)
+    data["RSI"] = 100 - (100 / (1 + rs))
+    prev = data["Close"].shift(1)
+    tr = pd.concat([data["High"] - data["Low"], abs(data["High"] - prev), abs(data["Low"] - prev)], axis=1).max(axis=1)
+    data["ATR"] = tr.ewm(alpha=1/14, adjust=False).mean()
+    return data
 
-def check_fvg(df):
-    for i in range(len(df)-5, len(df)-2):
-        h2, l2 = float(df['High'].iloc[i-2]), float(df['Low'].iloc[i-2])
-        h0, l0 = float(df['High'].iloc[i]), float(df['Low'].iloc[i])
-        if l0 > h2: return "BULL"
-        if h0 < l2: return "BEAR"
-    return None
+def add_patterns(data):
+    data = data.copy()
+    data['SwingHigh'] = data["High"].shift(1).rolling(5).max()
+    data['SwingLow'] = data["Low"].shift(1).rolling(5).min()
+    data['BOS_UP'] = (data["Close"] > data.SwingHigh) & (data["Close"].shift(1) <= data.SwingHigh.shift(1))
+    data['BOS_DOWN'] = (data["Close"] < data.SwingLow) & (data["Close"].shift(1) >= data.SwingLow.shift(1))
+    data['FVG_UP'] = data["Low"] > data["High"].shift(2)
+    data['FVG_DOWN'] = data["High"] < data["Low"].shift(2)
+    data['Sweep_Low'] = (data["Low"] < data.SwingLow) & (data["Close"] > data.SwingLow)
+    data['Sweep_High'] = (data["High"] > data.SwingHigh) & (data["Close"] < data.SwingHigh)
+    data['OB_UP'] = (data["Close"].shift(1) < data["Open"].shift(1)) & data.BOS_UP
+    data['OB_DOWN'] = (data["Close"].shift(1) > data["Open"].shift(1)) & data.BOS_DOWN
+    body = abs(data["Close"] - data["Open"])
+    total_range = data["High"] - data["Low"]
+    upper_wick = data["High"] - data[["Open", "Close"]].max(axis=1)
+    lower_wick = data[["Open", "Close"]].min(axis=1) - data["Low"]
+    data['Pin_Up'] = (lower_wick > 2 * body) & (upper_wick < 0.2 * total_range) & (data["Close"] > data["Open"])
+    data['Pin_Down'] = (upper_wick > 2 * body) & (lower_wick < 0.2 * total_range) & (data["Close"] < data["Open"])
+    data['Engulf_Up'] = (data["Close"] > data["Open"]) & (data["Close"].shift(1) < data["Open"].shift(1)) & (data["Close"] >= data["Open"].shift(1)) & (data["Open"] <= data["Close"].shift(1))
+    data['Engulf_Down'] = (data["Close"] < data["Open"]) & (data["Close"].shift(1) > data["Open"].shift(1)) & (data["Close"] <= data["Open"].shift(1)) & (data["Open"] >= data["Close"].shift(1))
+    return data
 
-def check_engulfing(df):
-    o1, c1 = float(df['Open'].iloc[-2]), float(df['Close'].iloc[-2])
-    o2, c2 = float(df['Open'].iloc[-1]), float(df['Close'].iloc[-1])
-    if c1 < o1 and c2 > o2 and c2 >= o1 and o2 <= c1: return "BULL"
-    if c1 > o1 and c2 < o2 and c2 <= o1 and o2 >= c1: return "BEAR"
-    return None
+def check_live_signal():
+    try:
+        df = get_data()
+        if len(df) < 200:
+            return None
 
-def check_structure(df):
-    highs, lows = find_pivots(df)
-    last_price = float(df['Close'].iloc[-1])
-    signal = None
-    
-    if len(highs) >= 2 and len(lows) >= 2:
-        last_high = highs[-1][1]
-        last_low = lows[-1][1]
+        m5 = df.copy()
+        m15 = resample_data(df, "15min")
+        h1 = resample_data(df, "1h")
 
-        if last_price > last_high: signal = "BULL"
-        elif last_price < last_low: signal = "BEAR"
-    return signal
+        m5 = add_patterns(add_indicators(m5))
+        m15 = add_patterns(add_indicators(m15))
+        h1 = add_patterns(add_indicators(h1))
 
-def check_liquidity(df):
-    highs, lows = find_pivots(df)
-    last_price = float(df['Close'].iloc[-1])
-    
-    if len(highs) >= 2:
-        if abs(highs[-1][1] - highs[-2][1]) / highs[-1][1] < 0.001:
-            if last_price < highs[-1][1]: return "BEAR"
-            
-    if len(lows) >= 2:
-        if abs(lows[-1][1] - lows[-2][1]) / lows[-1][1] < 0.001:
-            if last_price > lows[-1][1]: return "BULL"
-    return None
+        # گرفتن آخرین کندل بسته شده (نه کندل در حال تشکیل)
+        idx_m5 = len(m5) - 1
+        idx_m15 = len(m15) - 1
+        idx_h1 = len(h1) - 1
 
-def check_smart_money(df):
-    last_price = float(df['Close'].iloc[-1])
-    for i in range(len(df)-5, len(df)-1):
-        if float(df['Close'].iloc[i]) < float(df['Open'].iloc[i]):
-            if last_price > float(df['High'].iloc[i]): return "BULL"
-        if float(df['Close'].iloc[i]) > float(df['Open'].iloc[i]):
-            if last_price < float(df['Low'].iloc[i]): return "BEAR"
-    return None
+        # H1 Trend
+        h1_bull = h1['EMA50'].iloc[idx_h1] > h1['EMA200'].iloc[idx_h1]
+        h1_bear = h1['EMA50'].iloc[idx_h1] < h1['EMA200'].iloc[idx_h1]
 
-def check_orb(df):
-    df_ = df.copy()
-    df_['_date'] = df_.index.date
-    last_date = df_.index[-1].date()
-    group = df_[df_['_date'] == last_date]
-    
-    start_dt = pd.Timestamp.combine(last_date, dtime(13, 30)).tz_localize('UTC')
-    end_dt = start_dt + pd.Timedelta(minutes=30)
-    
-    or_win = group[(group.index >= start_dt) & (group.index < end_dt)]
-    if len(or_win) > 0:
-        or_high = float(or_win['High'].max())
-        or_low = float(or_win['Low'].min())
-        last_price = float(df['Close'].iloc[-1])
-        if last_price > or_high: return "BULL"
-        if last_price < or_low: return "BEAR"
-    return None
+        # M15 Filter
+        m15_rsi = m15['RSI'].iloc[idx_m15]
+        m15_bull_ok = m15_rsi > 45
+        m15_bear_ok = m15_rsi < 55
 
-# ================= موتور اصلی سیگنال =================
+        # M5 Triggers
+        row = m5.iloc[idx_m5]
+        bull_triggers = sum([row['FVG_UP'], row['Sweep_Low'], row['OB_UP'], row['Pin_Up'], row['Engulf_Up']])
+        bear_triggers = sum([row['FVG_DOWN'], row['Sweep_High'], row['OB_DOWN'], row['Pin_Down'], row['Engulf_Down']])
 
-def analyze_market(df):
-    signals = {
-        "FVG": check_fvg(df),
-        "Engulfing": check_engulfing(df),
-        "BOS/CHoCH/MSS": check_structure(df),
-        "Liquidity": check_liquidity(df),
-        "Smart Money": check_smart_money(df),
-        "ORB": check_orb(df)
-    }
+        atr = row['ATR']
+        entry = row['Close']
+        sl_dist = atr * 1.5
 
-    bull_score = sum(1 for v in signals.values() if v == "BULL")
-    bear_score = sum(1 for v in signals.values() if v == "BEAR")
+        if h1_bull and m15_bull_ok and bull_triggers >= 1:
+            sl = entry - sl_dist
+            tp1 = entry + sl_dist
+            tp2 = entry + (sl_dist * 2)
+            return f"🟢 <b>سیگنال خرید (LONG)</b>\n\n💰 ورود: {round(entry, 2)}\n🛑 حد ضرر: {round(sl, 2)}\n🎯 حد سود 1: {round(tp1, 2)}\n🎯 حد سود 2: {round(tp2, 2)}\n\n🧠 دلایل: H1 Trend + M15 RSI + {bull_triggers} الگوی M5"
 
-    current_price = float(df['Close'].iloc[-1])
-    recent_high = float(df['High'].tail(10).max())
-    recent_low = float(df['Low'].tail(10).min())
+        elif h1_bear and m15_bear_ok and bear_triggers >= 1:
+            sl = entry + sl_dist
+            tp1 = entry - sl_dist
+            tp2 = entry - (sl_dist * 2)
+            return f"🔴 <b>سیگنال فروش (SHORT)</b>\n\n💰 ورود: {round(entry, 2)}\n🛑 حد ضرر: {round(sl, 2)}\n🎯 حد سود 1: {round(tp1, 2)}\n🎯 حد سود 2: {round(tp2, 2)}\n\n🧠 دلایل: H1 Trend + M15 RSI + {bear_triggers} الگوی M5"
 
-    if bull_score >= 3:
-        entry = current_price
-        sl = recent_low - (recent_low * 0.001)
-        risk = entry - sl
-        tp = entry + (risk * 2)
-        active = [k for k, v in signals.items() if v == "BULL"]
-        return [f"🟢 <b>سیگنال خرید (LONG)</b>\n\n💰 ورود: {round(entry, 2)}\n🛑 حد ضرر: {round(sl, 2)}\n🎯 حد سود: {round(tp, 2)}\n\n🧠 <b>دلایل هم‌گرایی:</b>\n- " + "\n- ".join(active)]
-
-    elif bear_score >= 3:
-        entry = current_price
-        sl = recent_high + (recent_high * 0.001)
-        risk = sl - entry
-        tp = entry - (risk * 2)
-        active = [k for k, v in signals.items() if v == "BEAR"]
-        return [f"🔴 <b>سیگنال فروش (SHORT)</b>\n\n💰 ورود: {round(entry, 2)}\n🛑 حد ضرر: {round(sl, 2)}\n🎯 حد سود: {round(tp, 2)}\n\n🧠 <b>دلایل هم‌گرایی:</b>\n- " + "\n- ".join(active)]
-
-    return []
-
-# ================= حلقه اجرای ربات =================
+        return None
+    except Exception as e:
+        print(f"Error: {e}")
+        return None
 
 def bot_loop():
-    last_signal = None
-    send_telegram("🤖 <b>ربات هوشمند SMC روشن شد!</b>\nاز این به بعد ۲۴ ساعته با ۸ استراتژی بازار رو رصد می‌کنم.")
+    last_signal_time = None
+    last_signal_text = ""
+    
+    send_telegram("🤖 <b>ربات هوشمند جدید روشن شد!</b>\nاز این به بعد با استراتژی ترکیبی H1/M15/M5 بازار رو رصد می‌کنم.")
     
     while True:
         try:
-            df = get_data()
-            if not df.empty:
-                signals = analyze_market(df)
-                now = datetime.now().strftime("%Y-%m-%d %H:%M")
-                
-                if signals:
-                    current_sig = signals[0]
-                    if current_sig != last_signal:
-                        send_telegram(f"⏰ زمان: {now}\n\n{current_sig}")
-                        last_signal = current_sig
-            time.sleep(900)
+            signal_msg = check_live_signal()
+            now = datetime.utcnow()
+            
+            # اگر سیگنال پیدا شد
+            if signal_msg:
+                # کول داون 1 ساعته (اگر 1 ساعت از سیگنال قبلی گذشته باشد و متن سیگنال تکراری نباشد)
+                if last_signal_time is None or (now - last_signal_time).total_seconds() > 3600:
+                    send_telegram(f"⏰ زمان: {now.strftime('%Y-%m-%d %H:%M')} (UTC)\n\n{signal_msg}")
+                    last_signal_time = now
+            
+            time.sleep(300) # هر 5 دقیقه چک می‌کند
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"Loop Error: {e}")
             time.sleep(60)
 
 if __name__ == "__main__":
     threading.Thread(target=bot_loop, daemon=True).start()
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
-```
